@@ -1,0 +1,10 @@
+flask
+flask-cors
+requests
+pandas
+numpy
+meteostat
+shapely
+plotly
+prophet
+gunicorn
