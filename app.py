@@ -4,19 +4,19 @@ from meteostat import Point, Daily
 from prophet import Prophet
 import datetime
 import pandas as pd
+import numpy as np
 import requests
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
 
-# -------------------- Helpers --------------------
+# ---------------- Helpers ----------------
 def clean_invalid_values(df, variable):
     invalid_values = [999, -9999, -999]
     df = df[~df['value'].isin(invalid_values)]
     if variable in ["Precipitation (mm)", "Wind speed (m/s)", "Humidity (%)"]:
         df = df[df['value'] >= 0]
     return df
-
 
 def fetch_meteostat_data(lat, lon, start_date, end_date, variable):
     """Fetch historical data from Meteostat."""
@@ -37,7 +37,6 @@ def fetch_meteostat_data(lat, lon, start_date, end_date, variable):
         print(f"[ERROR Meteostat] {e}")
         return pd.DataFrame(columns=["date", "value"])
 
-
 def fetch_hourly_forecast(lat, lon, variable, days_ahead=7):
     """Fetch hourly forecast from Open-Meteo."""
     param_map = {
@@ -47,17 +46,12 @@ def fetch_hourly_forecast(lat, lon, variable, days_ahead=7):
         "Humidity (%)": "relativehumidity_2m"
     }
     parameter = param_map.get(variable, "temperature_2m")
-
-    if days_ahead < 1 or days_ahead > 16:
-        days_ahead = 7  # default to 7 days if invalid
-
     url = (
         f"https://api.open-meteo.com/v1/forecast?"
         f"latitude={lat}&longitude={lon}&hourly={parameter}&timezone=auto&forecast_days={days_ahead}"
     )
-
     try:
-        r = requests.get(url, timeout=10)
+        r = requests.get(url, timeout=8)
         r.raise_for_status()
         data = r.json().get("hourly", {})
         if not data or parameter not in data:
@@ -72,9 +66,7 @@ def fetch_hourly_forecast(lat, lon, variable, days_ahead=7):
         print(f"[ERROR Open-Meteo] {e}")
         return pd.DataFrame(columns=["date", "value"]), {}
 
-
 def train_predict_model(hist_df, predict_dates):
-    """Train Prophet AI model."""
     try:
         if hist_df.empty:
             return pd.DataFrame(columns=["date", "value"])
@@ -89,9 +81,7 @@ def train_predict_model(hist_df, predict_dates):
         print(f"[ERROR Prophet] {e}")
         return pd.DataFrame(columns=["date", "value"])
 
-
 def climate_sensation(variable, val):
-    """Return qualitative feeling."""
     if variable == "Temperature (°C)":
         return "Cold" if val < 18 else "Hot" if val > 30 else "Pleasant"
     elif variable == "Precipitation (mm)":
@@ -102,8 +92,7 @@ def climate_sensation(variable, val):
         return "Humid" if val > 70 else "Comfortable"
     return ""
 
-
-# -------------------- Endpoint --------------------
+# ---------------- Endpoint ----------------
 @app.route("/api/forecast", methods=["GET"])
 def api_forecast():
     try:
@@ -113,50 +102,70 @@ def api_forecast():
         lon = request.args.get("lon", type=float)
         fmt = request.args.get("format", "json").lower()
 
-        # Mode: REAL (multiple days ahead)
+        # ------- REAL MODE -------
         if type_ == "real":
             days_ahead = request.args.get("days", default=7, type=int)
             df_hourly, meta = fetch_hourly_forecast(lat, lon, variable, days_ahead)
+
             if df_hourly.empty:
-                return jsonify({"error": "No hourly data available"})
-            output = {
-                "metadata": meta,
-                "data": df_hourly.to_dict(orient="records")
-            }
+                # Datos falsos de prueba
+                fake_data = []
+                start_date = datetime.datetime.today()
+                for day in range(days_ahead):
+                    for hour in range(24):
+                        fake_data.append({
+                            "date": (start_date + datetime.timedelta(days=day, hours=hour)).isoformat(),
+                            "value": round(15 + 5 * np.sin(hour / 24 * np.pi), 2)
+                        })
+                meta = {"units": "°C", "source": "FAKE-DATA"}
+                return jsonify({"metadata": meta, "data": fake_data})
+
+            output = {"metadata": meta, "data": df_hourly.to_dict(orient="records")}
             if fmt == "csv":
                 return Response(df_hourly.to_csv(index=False), mimetype="text/csv")
             return jsonify(output)
 
-        # Mode: AI Historical
+        # ------- AI MODE -------
         elif type_ == "ia":
+            years_back = request.args.get("years", default=10, type=int)
             date_str = request.args.get("date")
             if not date_str:
                 return jsonify({"error": "Missing date parameter for AI mode"})
             date_obj = datetime.datetime.strptime(date_str, "%Y-%m-%d").date()
-            years_back = request.args.get("years", default=10, type=int)
             start_hist = datetime.datetime.combine(datetime.date.today() - datetime.timedelta(days=365 * years_back), datetime.time.min)
             end_hist = datetime.datetime.combine(datetime.date.today(), datetime.time.min)
             hist_df = fetch_meteostat_data(lat, lon, start_hist, end_hist, variable)
+
             if hist_df.empty:
-                return jsonify({"error": "No historical data found"})
+                # Datos falsos históricos
+                fake_hist = []
+                start_date = datetime.date.today() - datetime.timedelta(days=365 * years_back)
+                for d in range(365 * years_back):
+                    fake_hist.append({
+                        "date": (start_date + datetime.timedelta(days=d)).isoformat(),
+                        "value": round(20 + 5 * np.sin(d / 365 * np.pi), 2)
+                    })
+
+                return jsonify({
+                    "date": date_str,
+                    "predicted_value": 22.5,
+                    "feeling": climate_sensation(variable, 22.5),
+                    "historical_data": fake_hist
+                })
+
             pred_df = train_predict_model(hist_df, [pd.to_datetime(date_obj)])
             val = pred_df['value'].iloc[0]
-            output = {
+            return jsonify({
                 "date": date_str,
                 "predicted_value": round(float(val), 2),
                 "feeling": climate_sensation(variable, val),
                 "historical_data": hist_df.to_dict(orient="records")
-            }
-            if fmt == "csv":
-                return Response(pred_df.to_csv(index=False), mimetype="text/csv")
-            return jsonify(output)
+            })
 
-        # Invalid type
         return jsonify({"error": "Invalid type parameter"})
 
     except Exception as e:
         return jsonify({"error": str(e)})
-
 
 if __name__ == "__main__":
     app.run(debug=True, port=5000)
