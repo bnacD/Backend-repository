@@ -9,7 +9,7 @@ import requests
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
 
-# Tus claves API
+# API Keys
 WEATHERAPI_KEY = "60a4eb6709374ba2b5e32318250210"
 VISUALCROSSING_KEY = "66G6M8FZPJ3F3G9TDGFG2ZHRQ"
 
@@ -20,7 +20,7 @@ def clean_invalid_values(df):
     df = df[df['value'] >= 0]
     return df
 
-# ---------- REAL HOURLY ----------
+# ---------------- REAL HOURLY ----------------
 def fetch_hourly_opemeteo(lat, lon, variable, days_ahead=7):
     param_map = {
         "Temperature (°C)": "temperature_2m",
@@ -69,7 +69,29 @@ def fetch_hourly_weatherapi(lat, lon, variable, days_ahead=7):
         print("[ERROR WeatherAPI]", e)
         return pd.DataFrame(), {}
 
-# ---------- HISTORICAL ----------
+def fetch_hourly_nasa(lat, lon, variable, days_ahead=7):
+    var_map = {
+        "Temperature (°C)": "T2M",
+        "Precipitation (mm)": "PRECTOTCORR",
+        "Wind speed (m/s)": "WS10M",
+        "Humidity (%)": "RH2M"
+    }
+    param = var_map.get(variable)
+    end_date = datetime.date.today() + datetime.timedelta(days=days_ahead - 1)
+    start_date = datetime.date.today()
+    try:
+        url = (f"https://power.larc.nasa.gov/api/temporal/hourly/point?"
+               f"parameters={param}&community=RE&longitude={lon}&latitude={lat}&start={start_date.strftime('%Y%m%d')}&end={end_date.strftime('%Y%m%d')}&format=JSON")
+        r = requests.get(url, timeout=8)
+        r.raise_for_status()
+        data = r.json().get("properties", {}).get("parameter", {}).get(param, {})
+        records = [{"date": pd.to_datetime(ts), "value": val} for ts, val in data.items()]
+        return pd.DataFrame(records), {"units": "metric", "source": "NASA POWER"}
+    except Exception as e:
+        print("[ERROR NASA POWER hourly]", e)
+        return pd.DataFrame(), {}
+
+# ---------------- HISTORICAL ----------------
 def fetch_meteostat_data(lat, lon, start, end, variable):
     col_map = {
         "Temperature (°C)": "tavg",
@@ -111,7 +133,27 @@ def fetch_visualcrossing(lat, lon, start, end, variable):
         print("[ERROR VisualCrossing]", e)
         return pd.DataFrame()
 
-# ---------- AI prediction ----------
+def fetch_nasa_daily(lat, lon, start, end, variable):
+    var_map = {
+        "Temperature (°C)": "T2M",
+        "Precipitation (mm)": "PRECTOTCORR",
+        "Wind speed (m/s)": "WS10M",
+        "Humidity (%)": "RH2M"
+    }
+    param = var_map.get(variable)
+    try:
+        url = (f"https://power.larc.nasa.gov/api/temporal/daily/point?"
+               f"parameters={param}&community=RE&longitude={lon}&latitude={lat}&start={start.strftime('%Y%m%d')}&end={end.strftime('%Y%m%d')}&format=JSON")
+        r = requests.get(url, timeout=8)
+        r.raise_for_status()
+        data = r.json().get("properties", {}).get("parameter", {}).get(param, {})
+        records = [{"date": k, "value": v} for k, v in data.items()]
+        return pd.DataFrame(records)
+    except Exception as e:
+        print("[ERROR NASA POWER daily]", e)
+        return pd.DataFrame()
+
+# ---------------- AI prediction ----------------
 def train_predict_model(hist_df, predict_dates):
     try:
         hist_df = hist_df.rename(columns={'date': 'ds', 'value': 'y'})
@@ -136,7 +178,7 @@ def climate_sensation(variable, val):
         return "Humid" if val > 70 else "Comfortable"
     return ""
 
-# ---------- Endpoint ----------
+# ---------------- Endpoint ----------------
 @app.route("/api/forecast", methods=["GET"])
 def api_forecast():
     try:
@@ -148,15 +190,19 @@ def api_forecast():
 
         if type_ == "real":
             days_ahead = request.args.get("days", default=7, type=int)
+            # 1. Open-Meteo
             df, meta = fetch_hourly_opemeteo(lat, lon, variable, days_ahead)
+            # 2. WeatherAPI
             if df.empty:
                 df, meta = fetch_hourly_weatherapi(lat, lon, variable, days_ahead)
+            # 3. NASA POWER
+            if df.empty:
+                df, meta = fetch_hourly_nasa(lat, lon, variable, days_ahead)
             if df.empty:
                 return jsonify({"error": "No real data available from any source"})
-            output = {"metadata": meta, "data": df.to_dict(orient="records")}
             if fmt == "csv":
                 return Response(df.to_csv(index=False), mimetype="text/csv")
-            return jsonify(output)
+            return jsonify({"metadata": meta, "data": df.to_dict(orient="records")})
 
         elif type_ == "ia":
             years_back = request.args.get("years", default=10, type=int)
@@ -164,19 +210,23 @@ def api_forecast():
             if not date_str:
                 return jsonify({"error": "Missing date parameter for AI mode"})
             date_obj = datetime.datetime.strptime(date_str, "%Y-%m-%d").date()
-            start_hist = datetime.datetime.combine(
-                datetime.date.today() - datetime.timedelta(days=365 * years_back),
-                datetime.time.min
-            )
+            start_hist = datetime.datetime.combine(datetime.date.today() - datetime.timedelta(days=365 * years_back), datetime.time.min)
             end_hist = datetime.datetime.combine(datetime.date.today(), datetime.time.min)
 
+            # 1. Meteostat
             hist_df = fetch_meteostat_data(lat, lon, start_hist, end_hist, variable)
+            # 2. VisualCrossing
             if hist_df.empty:
                 hist_df = fetch_visualcrossing(lat, lon, start_hist.date(), end_hist.date(), variable)
+            # 3. NASA POWER
+            if hist_df.empty:
+                hist_df = fetch_nasa_daily(lat, lon, start_hist.date(), end_hist.date(), variable)
             if hist_df.empty:
                 return jsonify({"error": "No historical data available from any source"})
 
             pred_df = train_predict_model(hist_df, [pd.to_datetime(date_obj)])
+            if pred_df.empty:
+                return jsonify({"error": "Unable to generate prediction"})
             val = pred_df['value'].iloc[0]
             return jsonify({
                 "date": date_str,
@@ -186,6 +236,7 @@ def api_forecast():
             })
 
         return jsonify({"error": "Invalid type parameter"})
+
     except Exception as e:
         return jsonify({"error": str(e)})
 
