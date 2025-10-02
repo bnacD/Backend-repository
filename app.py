@@ -10,7 +10,7 @@ import requests
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
 
-# --- Helper functions ---
+# --- Helpers ---
 def clean_invalid_values(df, variable):
     invalid_values = [999, -9999, -999]
     df = df[~df['value'].isin(invalid_values)]
@@ -37,29 +37,26 @@ def fetch_meteostat_data(lat, lon, start_date, end_date, variable):
         return pd.DataFrame(columns=['date', 'value'])
 
 def fetch_hourly_forecast(lat, lon, variable):
-    try:
-        param_map = {
-            "Temperature (°C)": "temperature_2m",
-            "Precipitation (mm)": "precipitation",
-            "Wind speed (m/s)": "windspeed_10m",
-            "Humidity (%)": "relativehumidity_2m"
-        }
-        parameter = param_map.get(variable, "temperature_2m")
-        url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&hourly={parameter}&timezone=auto&forecast_days=14"
-        r = requests.get(url, timeout=10)
-        r.raise_for_status()
-        data = r.json().get("hourly", {})
-        if not data or parameter not in data:
-            return pd.DataFrame(columns=["date", "value"])
-        df = pd.DataFrame({
-            "date": pd.to_datetime(data["time"]),
-            "value": data[parameter]
-        })
-        meta = {"units": "units unknown", "source": "https://api.open-meteo.com"}
-        return df, meta
-    except Exception as e:
-        print(f"[ERROR Open-Meteo] {e}")
+    param_map = {
+        "Temperature (°C)": "temperature_2m",
+        "Precipitation (mm)": "precipitation",
+        "Wind speed (m/s)": "windspeed_10m",
+        "Humidity (%)": "relativehumidity_2m"
+    }
+    parameter = param_map.get(variable, "temperature_2m")
+    url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&hourly={parameter}&timezone=auto&forecast_days=16"
+
+    r = requests.get(url, timeout=10)
+    r.raise_for_status()
+    data = r.json().get("hourly", {})
+    if not data or parameter not in data:
         return pd.DataFrame(columns=["date", "value"]), {}
+    df = pd.DataFrame({
+        "date": pd.to_datetime(data["time"]),
+        "value": data[parameter]
+    })
+    meta = {"units": "units unknown", "source": "https://api.open-meteo.com"}
+    return df, meta
 
 def train_predict_model(hist_df, predict_dates):
     try:
@@ -87,37 +84,44 @@ def climate_sensation(variable, val):
         return "Humid" if val > 70 else "Comfortable"
     return ""
 
-# --- API routes ---
+# --- API ---
 @app.route("/api/forecast", methods=["GET"])
 def api_forecast():
     try:
-        type_ = request.args.get("type", "").lower()  # 'real' or 'ia'
+        type_ = request.args.get("type", "").lower()
         variable = request.args.get("variable", "Temperature (°C)")
         lat = float(request.args.get("lat"))
         lon = float(request.args.get("lon"))
-        date_str = request.args.get("date", datetime.date.today().strftime("%Y-%m-%d"))
+        date_str = request.args.get("date")
+        if not date_str:
+            return jsonify({"error": "Missing date parameter. Format: YYYY-MM-DD"})
         date_obj = datetime.datetime.strptime(date_str, "%Y-%m-%d").date()
-        format_out = request.args.get("format", "json").lower()
 
-        # --- REAL HOURLY MODE ---
         if type_ == "real":
+            today = datetime.date.today()
+            max_date = today + datetime.timedelta(days=15)
+            if date_obj < today or date_obj > max_date:
+                return jsonify({
+                    "error": f"Date out of range. Only accessible dates: {today} to {max_date}"
+                })
             df_hourly, meta = fetch_hourly_forecast(lat, lon, variable)
-            df_day = df_hourly[df_hourly['date'].dt.date == date_obj]
+            start_day = pd.Timestamp(date_obj)
+            end_day = start_day + pd.Timedelta(days=1)
+            df_day = df_hourly[(df_hourly['date'] >= start_day) & (df_hourly['date'] < end_day)]
             if df_day.empty:
-                return jsonify({"error": "No hourly data available"})
-            val = df_day['value'].mean()
+                return jsonify({"error": "No hourly data available for the selected date"})
+            avg_val = df_day['value'].mean()
             output = {
                 "metadata": meta,
                 "date": date_str,
-                "average_value": round(val, 2),
-                "feeling": climate_sensation(variable, val),
+                "average_value": round(avg_val, 2),
                 "data": df_day.to_dict(orient="records")
             }
-            if format_out == "csv":
+            fmt = request.args.get("format", "json").lower()
+            if fmt == "csv":
                 return Response(df_day.to_csv(index=False), mimetype="text/csv")
             return jsonify(output)
 
-        # --- AI/HISTORICAL MODE ---
         elif type_ == "ia":
             years_back = int(request.args.get("years", 10))
             start_hist = datetime.datetime.combine(datetime.date.today() - datetime.timedelta(days=365 * years_back), datetime.time.min)
@@ -133,7 +137,8 @@ def api_forecast():
                 "feeling": climate_sensation(variable, val),
                 "historical_data": hist_df.to_dict(orient="records")
             }
-            if format_out == "csv":
+            fmt = request.args.get("format", "json").lower()
+            if fmt == "csv":
                 return Response(pred_df.to_csv(index=False), mimetype="text/csv")
             return jsonify(output)
 
