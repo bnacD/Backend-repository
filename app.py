@@ -8,7 +8,7 @@ import requests
 import re
 import math
 import os
-from typing import Tuple, Dict, Any, Optional
+from typing import Tuple, Dict, Any, Optional, List
 
 app = Flask(__name__)
 CORS(app)
@@ -39,7 +39,7 @@ def smooth_series(df: pd.DataFrame, window: int = 3) -> pd.DataFrame:
         df['value'] = df['value'].rolling(window=window, min_periods=1).mean()
     return df
 
-# ============ METAR PARSING (Sin cambios) ============
+# ============ METAR PARSING ============
 def fetch_metar(station_code: str = "SGAS", max_age_minutes: int = 90) -> Dict[str, Any]:
     """Fetch and parse METAR data from NOAA."""
     try:
@@ -91,7 +91,7 @@ def fetch_metar(station_code: str = "SGAS", max_age_minutes: int = 90) -> Dict[s
         print(f"❌ [ERROR METAR {station_code}]", e)
         return {}
 
-# ============ HOURLY FORECAST APIs (Para modo REAL) ============
+# ============ HOURLY FORECAST APIs ============
 def fetch_hourly_nasa(lat: float, lon: float, variable: str, days_ahead: int = 7) -> Tuple[pd.DataFrame, Dict]:
     """Fetch hourly forecast from NASA POWER API."""
     var_map = {
@@ -219,13 +219,10 @@ def fetch_hourly_weatherapi(lat: float, lon: float, variable: str, days_ahead: i
         print(f"❌ [ERROR WeatherAPI] {e}")
         return pd.DataFrame(), {}
 
-# ============ DAILY HISTORICAL DATA (Para modo IA) ============
+# ============ DAILY HISTORICAL DATA APIs ============
 def fetch_meteostat_daily(lat: float, lon: float, start: datetime.date, 
                           end: datetime.date, variable: str) -> pd.DataFrame:
-    """
-    Fetch DAILY aggregated historical data from Meteostat.
-    Returns one value per day (not hourly).
-    """
+    """Fetch daily historical data from Meteostat."""
     col_map = {
         "Temperature (°C)": "tavg",
         "Precipitation (mm)": "prcp",
@@ -246,17 +243,17 @@ def fetch_meteostat_daily(lat: float, lon: float, start: datetime.date,
             
         df['value'] = df[column]
         df = df.reset_index()[['time', 'value']].rename(columns={'time': 'date'})
-        df['date'] = pd.to_datetime(df['date']).dt.date  # Ensure date type
+        df['date'] = pd.to_datetime(df['date']).dt.date
         df.dropna(subset=['value'], inplace=True)
         
         return clean_invalid_values(df)
     except Exception as e:
-        print(f"❌ [ERROR Meteostat daily] {e}")
+        print(f"❌ [ERROR Meteostat] {e}")
         return pd.DataFrame()
 
 def fetch_visualcrossing_daily(lat: float, lon: float, start: datetime.date, 
-                               end: datetime.date, variable: str) -> pd.DataFrame:
-    """Fetch DAILY historical data from Visual Crossing."""
+                                end: datetime.date, variable: str) -> pd.DataFrame:
+    """Fetch daily historical data from Visual Crossing."""
     if not VISUALCROSSING_KEY:
         return pd.DataFrame()
         
@@ -295,12 +292,12 @@ def fetch_visualcrossing_daily(lat: float, lon: float, start: datetime.date,
         
         return df
     except Exception as e:
-        print(f"❌ [ERROR VisualCrossing daily] {e}")
+        print(f"❌ [ERROR VisualCrossing] {e}")
         return pd.DataFrame()
 
 def fetch_nasa_daily(lat: float, lon: float, start: datetime.date, 
                      end: datetime.date, variable: str) -> pd.DataFrame:
-    """Fetch DAILY historical data from NASA POWER."""
+    """Fetch daily historical data from NASA POWER."""
     var_map = {
         "Temperature (°C)": "T2M",
         "Precipitation (mm)": "PRECTOTCORR",
@@ -333,85 +330,136 @@ def fetch_nasa_daily(lat: float, lon: float, start: datetime.date,
         print(f"❌ [ERROR NASA POWER daily] {e}")
         return pd.DataFrame()
 
-# ============ AI PREDICTION ============
-def train_predict_model(hist_df: pd.DataFrame, predict_date: datetime.date) -> Tuple[Optional[float], pd.DataFrame]:
+# ============ SCIENTIFIC ANALYSIS FUNCTIONS ============
+def get_historical_day_average(lat: float, lon: float, target_date: datetime.date, 
+                                variable: str, years_window: int = 10) -> Optional[Dict[str, Any]]:
     """
-    Train Prophet model and generate prediction for a specific date.
+    Get average value for a specific past date across multiple years.
     
-    Returns:
-        Tuple of (predicted_value, forecast_df)
+    🔧 FIX: Ensures dates stay within the same month/day across years.
+    """
+    records = []
+    
+    # 🐛 FIX: Validate target date before processing
+    print(f"🔍 DEBUG: Target date received: {target_date} (type: {type(target_date)})")
+    
+    for year_offset in range(years_window):
+        try:
+            # ✅ Create date with same month/day but different year
+            query_year = target_date.year - year_offset
+            
+            # Handle leap year edge case (Feb 29)
+            if target_date.month == 2 and target_date.day == 29:
+                try:
+                    query_date = datetime.date(query_year, 2, 29)
+                except ValueError:
+                    # Not a leap year, use Feb 28
+                    query_date = datetime.date(query_year, 2, 28)
+            else:
+                query_date = datetime.date(query_year, target_date.month, target_date.day)
+            
+            print(f"📅 Querying: {query_date}")
+            
+            # Fetch data for this specific day
+            df = fetch_meteostat_daily(lat, lon, query_date, query_date, variable)
+            if df.empty:
+                df = fetch_nasa_daily(lat, lon, query_date, query_date, variable)
+            if df.empty:
+                df = fetch_visualcrossing_daily(lat, lon, query_date, query_date, variable)
+            
+            if not df.empty:
+                records.append({
+                    "year": query_year,
+                    "date": query_date,  # ✅ Store actual date
+                    "value": float(df['value'].iloc[0])
+                })
+                
+        except Exception as e:
+            print(f"⚠️  Error processing year {query_year}: {e}")
+            continue
+    
+    if not records:
+        return None
+    
+    values = [r['value'] for r in records]
+    
+    return {
+        "date": target_date.isoformat(),
+        "average": round(float(pd.Series(values).mean()), 2),
+        "min": round(float(min(values)), 2),
+        "max": round(float(max(values)), 2),
+        "std_dev": round(float(pd.Series(values).std()), 2) if len(values) > 1 else 0,
+        "samples": len(records),
+        "years_data": [{"year": r["year"], "date": r["date"].isoformat(), "value": r["value"]} for r in records],
+        "source": "Historical observations"
+    }
+
+def train_predict_daily(hist_df: pd.DataFrame, target_date: datetime.date) -> Optional[Dict[str, Any]]:
+    """
+    Train Prophet model on daily historical data and predict a single future date.
+    
+    🔧 FIX: Ensures proper date handling and validation.
     """
     try:
-        if hist_df.empty or len(hist_df) < 10:
-            print("⚠️  Insufficient historical data for training")
-            return None, pd.DataFrame()
-            
-        # Prepare data for Prophet
-        hist_df = hist_df.copy()
-        hist_df['date'] = pd.to_datetime(hist_df['date'])
-        hist_df = hist_df.rename(columns={'date': 'ds', 'value': 'y'})
+        if hist_df.empty or len(hist_df) < 30:
+            print("⚠️  Insufficient historical data for training (need at least 30 days)")
+            return None
         
-        # Configure and train Prophet
+        # ✅ Validate and prepare data
+        hist_df = hist_df.copy()
+        hist_df['ds'] = pd.to_datetime(hist_df['date'])
+        hist_df['y'] = hist_df['value']
+        hist_df = hist_df[['ds', 'y']].sort_values('ds')
+        
+        print(f"📊 Training data range: {hist_df['ds'].min()} to {hist_df['ds'].max()}")
+        print(f"📊 Training samples: {len(hist_df)}")
+        print(f"🎯 Predicting for: {target_date}")
+        
+        # Configure Prophet
         model = Prophet(
-            daily_seasonality=False,  # Not needed for daily data
-            weekly_seasonality=True,
+            daily_seasonality=False,
             yearly_seasonality=True,
+            weekly_seasonality=False,
             changepoint_prior_scale=0.05,
-            seasonality_mode='multiplicative'
+            seasonality_prior_scale=10.0,
+            interval_width=0.95
         )
         
         model.fit(hist_df)
         
-        # Generate prediction for target date
-        future = pd.DataFrame({'ds': [pd.to_datetime(predict_date)]})
+        # ✅ Predict for exact target date
+        future = pd.DataFrame({'ds': [pd.to_datetime(target_date)]})
         forecast = model.predict(future)
         
-        predicted_value = forecast['yhat'].iloc[0]
+        print(f"✅ Prediction generated for {target_date}")
         
-        return float(predicted_value), forecast
+        return {
+            "date": target_date.isoformat(),
+            "predicted_value": round(float(forecast['yhat'].iloc[0]), 2),
+            "lower_bound": round(float(forecast['yhat_lower'].iloc[0]), 2),
+            "upper_bound": round(float(forecast['yhat_upper'].iloc[0]), 2),
+            "confidence": "95%",
+            "model": "Prophet",
+            "training_samples": len(hist_df),
+            "training_range": {
+                "start": hist_df['ds'].min().date().isoformat(),
+                "end": hist_df['ds'].max().date().isoformat()
+            }
+        }
+        
     except Exception as e:
-        print(f"❌ [ERROR Prophet] {e}")
-        return None, pd.DataFrame()
-
-def get_historical_day_value(hist_df: pd.DataFrame, target_date: datetime.date) -> Optional[float]:
-    """
-    Retrieve actual historical value for a specific past date.
-    
-    Returns:
-        The observed value for that day, or None if not available
-    """
-    try:
-        hist_df = hist_df.copy()
-        hist_df['date'] = pd.to_datetime(hist_df['date']).dt.date
-        
-        day_data = hist_df[hist_df['date'] == target_date]
-        
-        if not day_data.empty:
-            return float(day_data['value'].iloc[0])
-        else:
-            return None
-    except Exception as e:
-        print(f"❌ [ERROR retrieving historical day] {e}")
+        print(f"❌ [ERROR Prophet daily prediction] {e}")
+        import traceback
+        traceback.print_exc()
         return None
 
 # ============ API ENDPOINTS ============
 @app.route("/api/forecast", methods=["GET"])
 def api_forecast():
     """
-    Main forecast endpoint supporting real-time and AI prediction modes.
-    
-    Query Parameters:
-        - type: "real" or "ia"
-        - variable: Weather variable to query
-        - lat: Latitude
-        - lon: Longitude
-        
-    For type="real":
-        - days: Forecast days (default: 7)
-        
-    For type="ia":
-        - date: Target date in YYYY-MM-DD format
-        - years: Historical years to use for training (default: 10)
+    Main forecast endpoint with two modes:
+    - real: Real-time/hourly forecasts
+    - ia: Scientific daily analysis (past or future)
     """
     # ============ PARAMETER VALIDATION ============
     type_ = request.args.get("type", "").lower()
@@ -420,7 +468,6 @@ def api_forecast():
     
     variable = request.args.get("variable", "Temperature (°C)")
     
-    # Validate coordinates
     try:
         lat = float(request.args.get("lat"))
         lon = float(request.args.get("lon"))
@@ -431,9 +478,8 @@ def api_forecast():
     if not is_valid:
         return jsonify({"error": error_msg}), 400
     
-    # ============ REAL-TIME MODE (Sin cambios) ============
+    # ============ REAL-TIME MODE ============
     if type_ == "real":
-        # Try METAR first for real-time observations
         if variable in ["Temperature (°C)", "Wind speed (m/s)", "Humidity (%)"]:
             metar = fetch_metar("SGAS")
             if metar:
@@ -455,7 +501,6 @@ def api_forecast():
                         "type": "observation"
                     })
         
-        # Fallback to forecast APIs
         days = request.args.get("days", default=7, type=int)
         days = max(1, min(days, 16))
         
@@ -466,120 +511,77 @@ def api_forecast():
             df, meta = fetch_hourly_nasa(lat, lon, variable, days)
         
         if df.empty:
-            return jsonify({"error": "No real-time data available from any source"}), 404
+            return jsonify({"error": "No real-time data available"}), 404
         
         return jsonify({
             "metadata": meta,
             "data": df.to_dict(orient="records"),
-            "count": len(df)
+            "count": len(df),
+            "granularity": "hourly"
         })
     
-    # ============ AI SCIENTIFIC MODE ============
+    # ============ IA SCIENTIFIC MODE ============
     elif type_ == "ia":
         date_str = request.args.get("date")
         if not date_str:
-            return jsonify({"error": "Missing 'date' parameter for AI mode"}), 400
+            return jsonify({"error": "Missing 'date' parameter for IA mode"}), 400
         
+        # ✅ CRITICAL FIX: Proper date parsing
         try:
             target_date = datetime.datetime.strptime(date_str, "%Y-%m-%d").date()
         except ValueError:
             return jsonify({"error": "Invalid date format. Use YYYY-MM-DD"}), 400
         
-        today = datetime.date.today()
-        is_future = target_date > today
-        is_past = target_date < today
+        # ✅ Log for debugging
+        print(f"🔍 API received date: {date_str}")
+        print(f"🔍 Parsed as: {target_date}")
+        print(f"🔍 Month: {target_date.month}, Day: {target_date.day}")
         
+        today = datetime.date.today()
         years_back = request.args.get("years", default=10, type=int)
         years_back = max(1, min(years_back, 30))
         
-        # Define historical data range
-        start_hist = today - datetime.timedelta(days=365 * years_back)
-        end_hist = today - datetime.timedelta(days=1)  # Up to yesterday
-        
-        # ============ FETCH DAILY HISTORICAL DATA ============
-        print(f"📊 Fetching daily historical data from {start_hist} to {end_hist}")
-        
-        hist_df = fetch_meteostat_daily(lat, lon, start_hist, end_hist, variable)
-        if hist_df.empty:
-            hist_df = fetch_nasa_daily(lat, lon, start_hist, end_hist, variable)
-        if hist_df.empty:
-            hist_df = fetch_visualcrossing_daily(lat, lon, start_hist, end_hist, variable)
-        
-        if hist_df.empty:
-            return jsonify({"error": "No historical data available for analysis"}), 404
-        
-        # ============ CASE 1: PAST DATE ============
-        if is_past:
-            observed_value = get_historical_day_value(hist_df, target_date)
+        # ============ PAST DATE: Return historical average ============
+        if target_date < today:
+            result = get_historical_day_average(lat, lon, target_date, variable, years_back)
             
-            if observed_value is not None:
-                # Return actual observed value
+            if not result:
                 return jsonify({
-                    "date": date_str,
-                    "type": "historical_observation",
-                    "value": round(observed_value, 2),
-                    "source": "Historical records",
-                    "variable": variable,
-                    "metadata": {
-                        "data_source": "Meteostat/NASA POWER/Visual Crossing",
-                        "observation_type": "daily_average"
-                    },
-                    "historical_context": {
-                        "available_data_points": len(hist_df),
-                        "data_range": f"{hist_df['date'].min()} to {hist_df['date'].max()}"
-                    }
-                })
-            else:
-                return jsonify({
-                    "error": f"No historical data available for {date_str}",
-                    "available_range": f"{hist_df['date'].min()} to {hist_df['date'].max()}"
+                    "error": f"No historical data available for {target_date.isoformat()}",
+                    "requested_date": target_date.isoformat()
                 }), 404
-        
-        # ============ CASE 2: FUTURE DATE ============
-        elif is_future:
-            predicted_value, forecast_df = train_predict_model(hist_df, target_date)
-            
-            if predicted_value is None:
-                return jsonify({"error": "Unable to generate prediction"}), 500
-            
-            # Calculate prediction interval
-            prediction_lower = None
-            prediction_upper = None
-            if not forecast_df.empty and 'yhat_lower' in forecast_df.columns:
-                prediction_lower = float(forecast_df['yhat_lower'].iloc[0])
-                prediction_upper = float(forecast_df['yhat_upper'].iloc[0])
             
             return jsonify({
-                "date": date_str,
-                "type": "ai_prediction",
-                "predicted_value": round(predicted_value, 2),
-                "prediction_interval": {
-                    "lower": round(prediction_lower, 2) if prediction_lower else None,
-                    "upper": round(prediction_upper, 2) if prediction_upper else None,
-                    "confidence": "80%"
-                },
-                "model": "Prophet (Meta/Facebook)",
-                "variable": variable,
-                "training_metadata": {
-                    "training_samples": len(hist_df),
-                    "training_period_years": years_back,
-                    "data_range": f"{hist_df['date'].min()} to {hist_df['date'].max()}",
-                    "model_components": ["trend", "weekly_seasonality", "yearly_seasonality"]
-                },
-                "historical_statistics": {
-                    "mean": round(hist_df['value'].mean(), 2),
-                    "std": round(hist_df['value'].std(), 2),
-                    "min": round(hist_df['value'].min(), 2),
-                    "max": round(hist_df['value'].max(), 2)
-                }
+                **result,
+                "analysis_type": "historical_average",
+                "granularity": "daily",
+                "requested_date": target_date.isoformat()
             })
         
-        # ============ CASE 3: TODAY ============
-        else:  # target_date == today
+        # ============ FUTURE DATE: Use Prophet prediction ============
+        else:
+            start_hist = today - datetime.timedelta(days=365 * years_back)
+            
+            hist_df = fetch_meteostat_daily(lat, lon, start_hist, today, variable)
+            if hist_df.empty:
+                hist_df = fetch_nasa_daily(lat, lon, start_hist, today, variable)
+            if hist_df.empty:
+                hist_df = fetch_visualcrossing_daily(lat, lon, start_hist, today, variable)
+            
+            if hist_df.empty:
+                return jsonify({"error": "No historical data for training"}), 404
+            
+            result = train_predict_daily(hist_df, target_date)
+            
+            if not result:
+                return jsonify({"error": "Unable to generate prediction"}), 500
+            
             return jsonify({
-                "error": "For today's data, use type='real' instead",
-                "suggestion": f"/api/forecast?type=real&variable={variable}&lat={lat}&lon={lon}"
-            }), 400
+                **result,
+                "analysis_type": "future_prediction",
+                "granularity": "daily",
+                "requested_date": target_date.isoformat()
+            })
 
 @app.route("/api/health", methods=["GET"])
 def health_check():
@@ -587,6 +589,7 @@ def health_check():
     return jsonify({
         "status": "healthy",
         "timestamp": datetime.datetime.utcnow().isoformat(),
+        "server_date": datetime.date.today().isoformat(),
         "apis_configured": {
             "weatherapi": bool(WEATHERAPI_KEY),
             "visualcrossing": bool(VISUALCROSSING_KEY)
@@ -605,11 +608,10 @@ def internal_error(error):
 # ============ MAIN ============
 if __name__ == "__main__":
     print("🌦️  Weather Forecast API Starting...")
+    print(f"📅 Server date: {datetime.date.today()}")
     print(f"📍 NASA POWER: ✓")
     print(f"📍 Open-Meteo: ✓")
-    print(f"📍 WeatherAPI: {'✓' if WEATHERAPI_KEY else '✗ (not configured)'}")
-    print(f"📍 Visual Crossing: {'✓' if VISUALCROSSING_KEY else '✗ (not configured)'}")
-    print("\n📊 Mode Configuration:")
-    print("   • REAL mode: Hourly forecasts (next 7-16 days)")
-    print("   • IA mode: Daily analysis (past observations + future predictions)")
+    print(f"📍 Meteostat: ✓")
+    print(f"📍 WeatherAPI: {'✓' if WEATHERAPI_KEY else '✗'}")
+    print(f"📍 Visual Crossing: {'✓' if VISUALCROSSING_KEY else '✗'}")
     app.run(debug=True, port=5000, host="0.0.0.0")
