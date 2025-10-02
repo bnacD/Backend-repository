@@ -10,8 +10,18 @@ import math
 import os
 from typing import Tuple, Dict, Any, Optional, List
 
+from flask_cors import CORS
+
 app = Flask(__name__)
-CORS(app)
+
+# ✅ Configuración CORS para permitir requests desde cualquier origen
+CORS(app, resources={
+    r"/api/*": {
+        "origins": "*",  # En producción, especifica tu dominio del frontend
+        "methods": ["GET", "POST", "OPTIONS"],
+        "allow_headers": ["Content-Type"]
+    }
+})
 
 # ============ CONFIGURATION ============
 WEATHERAPI_KEY = os.getenv("WEATHERAPI_KEY", "")
