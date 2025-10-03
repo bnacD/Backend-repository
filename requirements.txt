@@ -6,3 +6,14 @@ prophet==1.1.5
 pandas==2.1.3
 requests==2.31.0
 numpy==1.24.3
+flask
+flask-cors
+requests
+pandas
+numpy
+meteostat
+shapely
+plotly
+prophet
+gunicorn
+python-dotenv      # Para manejar variables de entorno (.env)
